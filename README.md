@@ -14,6 +14,8 @@ This runs an example CLI MCP client instance that uses any LLM model that has to
 - Mistal
 - ...
 
+It uses tools from other MCP servers, specifically the local MCP server in the same repository that calls the weather API
+
 ## `local_mcp_local_resources_example`
 
 ```bash
