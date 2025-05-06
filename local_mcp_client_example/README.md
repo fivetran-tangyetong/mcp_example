@@ -60,13 +60,16 @@ The query bit is pretty simple, there are 2 scenarios here:
 9. We output that response
 
 ## Key Takeaways
-The most important point here is that the LLM is **not connected the the server**.
+The most important point here is that the **LLM is not connected the the server**.
 
-This is because the LLM decides that the tool usage is necessary, and tell us it is necessary, with the tool name and args as well.
-It is up to us, the **client**, to call the tool, then pass the results back into the LLM for natural language encoding of the results.
+The LLM decides that what tool usage is necessary, and tell the client it is necessary, with the tool name and args as well.
+It is up to the **client**, to call the tool, then pass the results back into the LLM for natural language encoding of the results.
 
 For local MCP servers, when we edit the claude for desktop config JSON, we are telling it to run `uv run //[YOUR_DIRECTORU//[SERVER_FILE].py` for example.
 Claude for Desktop (the LLM), then sets up a client that connects to the MCP server (locally).
 
 The LLM here can have multiple clients having 1:1 connections with multiple MCP servers, and handles the tool calling under the hood for you, but at the end of the day,
 the LLM itself is not firing off the MCP tools by itself.
+
+<img width="687" alt="Screenshot 2025-05-06 at 4 40 50 PM" src="https://github.com/user-attachments/assets/48f92b44-3ed2-4dda-a1d3-0461571620a7" />
+
