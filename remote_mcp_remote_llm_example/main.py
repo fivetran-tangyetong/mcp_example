@@ -1,11 +1,11 @@
 import os
 import json
-import time
 import requests
-import dotenv
+from dotenv import load_dotenv
 from sseclient import SSEClient
-from google.cloud import aiplatform
-from google.ai.generative.language import ChatModel
+from google import genai
+from google.genai import types
+from urllib.parse import quote_plus
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -18,9 +18,9 @@ GITHUB_OWNER  = "fivetran-tangyetong"
 GITHUB_REPO   = "NerveAnatomy"
 REPO_URL      = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
 
-# 2) Google Cloud / Vertex AI (Gemini chat)
-GCP_PROJECT   = "your-gcp-project-id"
-GCP_LOCATION  = "us-central1"  # adjust as needed
+# 2) Gemini
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "<DEFAULT_GOOGLE_API_KEY>")
+GEMINI_MODEL  = "gemini-2.5-pro-exp-03-25"
 
 # 3) Apify MCP endpoints & actor IDs
 MCP_BASE      = "https://actors-mcp-server.apify.actor"
@@ -30,38 +30,49 @@ ACTOR_ISSUES  = "apify/github-issues-scraper"
 
 # ─── Helpers: MCP Session + RPC Calls ──────────────────────────────────────────
 
-def start_mcp_session(actors):
-    """
-    Open an SSE session to the Apify MCP server and return the sessionId.
-    """
-    url = (
-        f"{MCP_BASE}/sse?"
-        f"token={APIFY_TOKEN}&actors={','.join(actors)}"
-    )
-    for event in SSEClient(url):
-        data = json.loads(event.data)
-        if "sessionId" in data:
-            return data["sessionId"]
+def start_mcp_session():
+    """Open the SSE stream and extract the session_id."""
+    sse_url = f"{MCP_BASE}/sse?token={APIFY_TOKEN}"
+    client = SSEClient(sse_url)
+    for event in client:
+        if not event.data or not event.data.strip():
+            continue
+        # look for the sessionId in the initial 'endpoint' event
+        if "sessionId=" in event.data:
+            session_id = event.data.split("sessionId=")[1]
+            return client, session_id
     raise RuntimeError("Failed to obtain sessionId from MCP SSE")
 
 
-def mcp_call(session_id, actor_name, run_input):
+def mcp_call(client, session_id, actor_name, run_input, call_id):
     """
-    Send a JSON-RPC tools/call to invoke the given actor with run_input.
+    Send a JSON-RPC call, then block until we see a matching SSE 'message' with id==call_id.
+    Returns the 'result' dict from that JSON-RPC response.
     """
-    url = f"{MCP_BASE}/message?token={APIFY_TOKEN}&session_id={session_id}"
+    post_url = f"{MCP_BASE}/message?token={APIFY_TOKEN}&session_id={session_id}"
     payload = {
         "jsonrpc": "2.0",
-        "id": 1,
+        "id": call_id,
         "method": "tools/call",
         "params": {
             "name": actor_name,
             "arguments": run_input,
         },
     }
-    resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
+    resp = requests.post(post_url, json=payload, headers={"Content-Type": "application/json"})
     resp.raise_for_status()
-    return resp.json()
+    print(f">>> Called {actor_name} (id={call_id}) → {resp.text.strip()}")
+
+    # now wait for the matching JSON-RPC reply over SSE
+    for event in client:
+        if event.event == "message" and event.data:
+            data = json.loads(event.data)
+            if data.get("id") == call_id:
+                if "error" in data:
+                    raise RuntimeError(f"Actor error: {data['error']}")
+                return data["result"]
+
+    raise RuntimeError(f"No response received for call id={call_id}")
 
 
 def collect_dataset_items(dataset_id):
@@ -76,25 +87,37 @@ def collect_dataset_items(dataset_id):
 
 # ─── 1) Kick off both actors via MCP ────────────────────────────────────────────
 
-session = start_mcp_session([ACTOR_CODE, ACTOR_ISSUES])
+client, session = start_mcp_session()
 
 # 1a) Scrape code files
-code_run = mcp_call(session, ACTOR_CODE, {
-    "token":       GITHUB_TOKEN,
-    "repoUrl":     REPO_URL,
-    "mode":        "repo",
-    "includePaths":["**/*.py","**/*.js","**/*.md"],
-})
-code_dataset = code_run["result"]["defaultDatasetId"]
+code_run = mcp_call(
+    client,
+    session,
+    ACTOR_CODE,
+    {
+        "token":       GITHUB_TOKEN,
+        "repoUrl":     f"https://github.com/fivetran-tangyetong/NerveAnatomy",
+        "mode":        "repo",
+        "includePaths":["**/*.py","**/*.js","**/*.md","**/*.tsx","**/*.ts"],
+    },
+    call_id=1,
+)
+code_dataset = code_run["defaultDatasetId"]
 
 # 1b) Scrape issues
-issues_run = mcp_call(session, ACTOR_ISSUES, {
-    "token": GITHUB_TOKEN,
-    "owner": GITHUB_OWNER,
-    "repo":  GITHUB_REPO,
-    "state": "open"
-})
-issues_dataset = issues_run["result"]["defaultDatasetId"]
+issues_run = mcp_call(
+    client,
+    session,
+    ACTOR_ISSUES,
+    {
+        "token": GITHUB_TOKEN,
+        "owner": "fivetran-tangyetong",
+        "repo":  "NerveAnatomy",
+        "state": "open",
+    },
+    call_id=2,
+)
+issues_dataset = issues_run["defaultDatasetId"]
 
 
 # ─── 2) Pull down the results via the Apify HTTP API ────────────────────────────
@@ -113,18 +136,16 @@ issues_text = "\n\n".join(
 )
 
 
-# ─── 3) Initialize Vertex AI & Gemini chat model ──────────────────────────────
+# ─── 3) Initialize Gemini chat model ──────────────────────────────
 
-aiplatform.init(project=GCP_PROJECT, location=GCP_LOCATION)
-chat_model = ChatModel.from_pretrained("chat-bison-001")
-
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
 # ─── 4) Build and send the chat prompt ──────────────────────────────────────────
 
 system_prompt = (
     "You are a senior software engineer. "
     "The user will provide GitHub code and open issues. "
-    "Help them understand the repo’s purpose, main modules, "
+    "Help them understand the repo's purpose, main modules, "
     "and summarize the top pain points from the issues."
 )
 
@@ -136,14 +157,15 @@ user_prompt = (
     "Please provide a clear, concise chat-style summary."
 )
 
-response = chat_model.chat(
-    context=[
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_prompt},
-    ],
-    temperature=0.1,
-    max_output_tokens=1024,
+chat = client.chats.create(
+    model=GEMINI_MODEL,
+    config=types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        temperature=0.1,
+        max_output_tokens=1024,
+    ),
 )
 
+response = chat.send_message(user_prompt)
 print("\n===== Chat Summary =====\n")
-print(response.choices[0].message.content)
+print(response.text)
